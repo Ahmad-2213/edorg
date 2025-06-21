@@ -5,25 +5,25 @@ import { connect } from 'cloudflare:sockets'
  */
 const SETTINGS = {
   UUID: '', // vless UUID
-  PROXY: '87.128.18.23', // optional proxy hostname or IP
-  LOG_LEVEL: 'debug', // debug, info, error, none
+  PROXY: '', // optional proxy hostname or IP
+  LOG_LEVEL: 'none', // debug, info, error, none
   TIME_ZONE: '0', // time zone for logs (in hours)
-  
+
   WS_PATH: '/ws', // path for websocket transport (enable by non‑empty string)
-  DOH_QUERY_PATH: '/dns-query', // path for DNS over HTTPS queries
+  DOH_QUERY_PATH: '', // path for DNS over HTTPS queries
   UPSTREAM_DOH: 'https://dns.google/dns-query',
   IP_QUERY_PATH: '',
 
-  BUFFER_SIZE: '0', // in KiB; setting to '0' means no explicit buffering (workers CPU load is mitigated by native stream passthrough)
+  BUFFER_SIZE: '0', // in KiB; set to '0' to disable buffering
   XHTTP_PATH: '/xhttp',
   XPADDING_RANGE: '0',
 
   // We now use only the pipe relay so that we delegate most work to pipeTo().
   RELAY_SCHEDULER: 'pipe',
-
 };
 
-
+// Cache for processed configuration
+let cfgCache = null;
 
 // A constant response for bad requests.
 const BAD_REQUEST = new Response(null, {
@@ -35,10 +35,15 @@ const BAD_REQUEST = new Response(null, {
    Utility Functions
    ───────────────────────────────────────────────────────────────────────────── */
 
-   function validate_uuid(received, expected) {
-    return crypto.subtle.timingSafeEqual(received, expected);
+// Validate that two 16‑byte UUID arrays are equal.
+function validate_uuid(left, right) {
+  for (let i = 0; i < 16; i++) {
+    if (left[i] !== right[i]) return false;
   }
+  return true;
+}
 
+// Concatenate Uint8Arrays.
 function concat_typed_arrays(...arrays) {
   const total = arrays.reduce((sum, a) => sum + a.length, 0);
   const result = new Uint8Array(total);
@@ -71,7 +76,7 @@ function random_uuid() {
   return `${s4()}${s4()}-${s4()}-${s4()}-${s4()}-${s4()}${s4()}${s4()}`;
 }
 
-const MAX_PADDING_LENGTH = 1000;
+const MAX_PADDING_LENGTH = 256;
 
 function random_padding(range_str) {
   if (!range_str || range_str === '0' || typeof range_str !== 'string') return null;
@@ -82,39 +87,19 @@ function random_padding(range_str) {
     .slice(0, 2)
     .sort((a, b) => a - b);
   if (range.length === 0 || range[0] < 1) return null;
+  // Pick a random length within the range.
   let len = range[0] === range[1] ? range[0] : random_num(range[0], range[1]);
+  // Cap the padding length to avoid HTTP/2 header frame size issues.
   len = Math.min(len, MAX_PADDING_LENGTH);
   return '0'.repeat(len);
 }
 
+// Convert a UUID string (with dashes) into a Uint8Array.
 function parse_uuid(uuid) {
+  const hex = uuid.replace(/-/g, '');
   const bytes = new Uint8Array(16);
-  let byteIndex = 0, haveNibble = false, nibble = 0;
-  for (let i = 0, len = uuid.length; i < len && byteIndex < 16; i++) {
-    const code = uuid.charCodeAt(i);
-    if (code === 45) continue; // Skip '-' (ASCII 45)
-    let value;
-    // '0'-'9'
-    if (code >= 48 && code <= 57) {
-      value = code - 48;
-    }
-    // 'A'-'F'
-    else if (code >= 65 && code <= 70) {
-      value = code - 55;
-    }
-    // 'a'-'f'
-    else if (code >= 97 && code <= 102) {
-      value = code - 87;
-    } else {
-      throw new Error('Invalid UUID character');
-    }
-    if (!haveNibble) {
-      nibble = value;
-      haveNibble = true;
-    } else {
-      bytes[byteIndex++] = (nibble << 4) | value;
-      haveNibble = false;
-    }
+  for (let i = 0; i < 32; i += 2) {
+    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
   }
   return bytes;
 }
@@ -122,11 +107,12 @@ function parse_uuid(uuid) {
 /**
  * Decodes a modified Base64 string (URL‑friendly, using "-" and "_" instead of "+" and "/")
  * into an ArrayBuffer. Returns null on failure.
+ * @param {string} base64Str 
+ * @returns {ArrayBuffer|null}
  */
 function base64ToArrayBuffer(base64Str) {
   try {
-    // Replace without regex:
-    base64Str = base64Str.split('-').join('+').split('_').join('/');
+    base64Str = base64Str.replace(/-/g, '+').replace(/_/g, '/');
     const binaryStr = atob(base64Str);
     const len = binaryStr.length;
     const bytes = new Uint8Array(len);
@@ -139,7 +125,6 @@ function base64ToArrayBuffer(base64Str) {
   }
 }
 
-
 /* ─────────────────────────────────────────────────────────────────────────────
    Logger
    ───────────────────────────────────────────────────────────────────────────── */
@@ -149,6 +134,7 @@ class Logger {
     this.inner_id = random_id();
     const tz = parseInt(time_zone);
     this.timeDrift = isNaN(tz) ? 0 : tz * 60 * 60 * 1000;
+    // Levels: debug (0), info (1), error (2), none (3)
     const levels = ['debug', 'info', 'error', 'none'];
     this.level = levels.indexOf((log_level || 'info').toLowerCase());
   }
@@ -171,8 +157,12 @@ class Logger {
    Reading and Parsing VLESS Header
    ───────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * Reads the VLESS header from the client stream.
+ * Throws if the header is too short or the UUID is invalid.
+ */
 async function read_vless_header(reader, cfg_uuid_str) {
-  let capacity = 8192;
+  let capacity = 2048;
   let buffer = new Uint8Array(capacity);
   let offset = 0;
   const view = new DataView(buffer.buffer);
@@ -232,7 +222,9 @@ async function read_vless_header(reader, cfg_uuid_str) {
   return {
     hostname,
     port,
+    // Extra client data (if any) after the header.
     data: buffer.subarray(header_len, offset),
+    // The response to send to the client.
     resp: new Uint8Array([version, 0]),
   };
 }
@@ -250,6 +242,10 @@ async function parse_header(uuid_str, client) {
    Connecting and Relaying
    ───────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * A helper that always uses pipeTo() to relay data between two streams.
+ * (This avoids the overhead of manually reading/writing small chunks.)
+ */
 async function pipeRelay(src, dest, initialData) {
   if (initialData && initialData.byteLength > 0) {
     const writer = dest.writable.getWriter();
@@ -259,11 +255,11 @@ async function pipeRelay(src, dest, initialData) {
       writer.releaseLock();
     }
   }
-  const options = src.signal ? { signal: src.signal } : {};
-  return src.readable.pipeTo(dest.writable, options);
+  return src.readable.pipeTo(dest.writable, { signal: src.signal });
 }
 
-async function relayConnections( log, client, remote, vless) {
+async function relayConnections(cfg, log, client, remote, vless) {
+  // Start piping in both directions concurrently.
   const upload = pipeRelay(client, remote, vless.data).catch(err => {
     if (err.name !== 'AbortError') log.error("Upload error:", err.message);
   });
@@ -275,6 +271,7 @@ async function relayConnections( log, client, remote, vless) {
     .catch(err => log.error("Relay encountered an error:", err.message));
 }
 
+// When the client aborts the connection, close the remote.
 function watch_abort_signal(log, signal, remote) {
   if (!signal || !remote) return;
   const handler = () => {
@@ -286,6 +283,9 @@ function watch_abort_signal(log, signal, remote) {
   signal.addEventListener('abort', handler, { once: true });
 }
 
+/**
+ * Connect to the remote destination using a timeout.
+ */
 async function timed_connect(hostname, port, ms) {
   return new Promise((resolve, reject) => {
     const conn = connect({ hostname, port });
@@ -300,105 +300,40 @@ async function timed_connect(hostname, port, ms) {
   });
 }
 
+// Precompiled IPv4 validation regex.
 const IPV4_REGEX = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
 
-let connectionHistory = {};
-const DIRECT_SUCCESS_COOL_DOWN = 30000; // 30 seconds
-
-function recordDirectSuccess(hostname) {
-  connectionHistory[hostname] = Date.now();
-}
-
-function directRecently(hostname) {
-  return connectionHistory[hostname] && (Date.now() - connectionHistory[hostname] < DIRECT_SUCCESS_COOL_DOWN);
-}
-
-function isEpicGamesDomain(hostname) {
-  return /(?:epicgames\.com|epicgamescdn\.com|riotgames\.com|api\.riotgames\.com|ddragon\.leagueoflegends\.com|riotstatic\.com|riotcdn\.net|akamaized\.net|fastly-download\.epicgames\.com|clashofclans\.com|ubisoft(?:connect)?\.com|ubisoftcdn\.com|uplay(?:cdn)?\.com|supercell(?:content)?\.net|d\d+\.[a-z0-9-]+\.cloudfront\.net)/i.test(hostname);
-}
-
-const proxyFailureBlacklist = {};
-function markProxyForbidden(hostname) {
-  proxyFailureBlacklist[hostname] = true;
-}
-
-/**
- * Returns true if `ip` is a valid IPv4 or IPv6 address literal.
- */
-function isIPAddress(ip) {
-  // --- IPv4 check ---
-  if (ip.includes('.')) {
-    const parts = ip.split('.');
-    if (parts.length !== 4) return false;
-    for (const part of parts) {
-      // no leading zeros (unless the part is exactly "0")
-      if (!/^\d+$/.test(part) || (part.length > 1 && part.startsWith('0'))) return false;
-      const n = Number(part);
-      if (n < 0 || n > 255) return false;
-    }
-    return true;
-  }
-
-  // --- IPv6 check ---
-  if (ip.includes(':')) {
-    // Split on '::' for compressed zeros
-    const comps = ip.split('::');
-    if (comps.length > 2) return false;
-
-    // parts before and after '::'
-    const head = comps[0] === '' ? [] : comps[0].split(':');
-    const tail = comps[1] ? comps[1].split(':') : [];
-
-    // total hextets must be <= 8
-    if (head.length + tail.length > 8) return false;
-
-    const validHextet = s =>
-      /^[0-9A-Fa-f]{1,4}$/.test(s);
-
-    for (const seg of [...head, ...tail]) {
-      if (!validHextet(seg)) return false;
-    }
-
-    return true;
-  }
-
-  // neither IPv4 nor IPv6
-  return false;
-}
-
-
-
 async function connect_remote(log, hostname, port, cfg_proxy) {
-  const timeout = 1000
-  
- 
-  if (isIPAddress(hostname)) {
-    try {
-        log.info(`direct connect to IP [${hostname}]:${port}`)
-        return await timed_connect(hostname, port, timeout)
-    } catch (err) {
-        log.error(`direct connect to IP failed: ${err.message}`)
-    }
-    
-}
-  const proxy = (cfg_proxy)
-  if (proxy) {
-      try {
-        log.info(`proxy connect [${hostname}]:${port} through [${proxy}]`)
-        return await timed_connect(proxy, port, timeout)
-      } catch (err) {
-        log.debug(`proxy connect failed: ${err.message}`)
-      }
-      
-    } 
+  const timeout = 1000;
+  // Pre-process hostname and port once.
+  const trimmedHost = hostname.trim();
+  const portStr = port.toString();
 
-  throw new Error('all connection attempts failed')
+  // If the hostname is a valid IPv4, use direct connection.
+  if (IPV4_REGEX.test(trimmedHost)) {
+    log.info(`Direct IP connect [${trimmedHost}]:${portStr}`);
+    return timed_connect(trimmedHost, portStr, timeout);
+  }
+
+  // For non‑IPv4 hostnames, require a proxy.
+  const proxy = cfg_proxy?.trim();
+  if (!proxy) {
+    const errorMsg = `Proxy connection required for hostname [${trimmedHost}], but no proxy provided.`;
+    log.error(errorMsg);
+    throw new Error(errorMsg);
+  }
+
+  log.info(`Proxy connect [${trimmedHost}]:${portStr} via [${proxy}]`);
+  // Attempt the proxy connection; if it fails, the error will propagate.
+  return await timed_connect(proxy, portStr, timeout);
 }
+
+
 async function handle_client(cfg, log, client) {
   try {
     const vless = await parse_header(cfg.UUID, client);
     const remote = await connect_remote(log, vless.hostname, vless.port, cfg.PROXY);
-    relayConnections( log, client, remote, vless);
+    relayConnections(cfg, log, client, remote, vless);
     watch_abort_signal(log, client.signal, remote);
     return true;
   } catch (err) {
@@ -408,37 +343,33 @@ async function handle_client(cfg, log, client) {
   }
 }
 
-
-
 /* ─────────────────────────────────────────────────────────────────────────────
    XHTTP and WebSocket Client Factories
    ───────────────────────────────────────────────────────────────────────────── */
 
-/**
- * Create a queuing strategy with the given buff_size (in bytes).
- */
 function create_queuing_strategy(buff_size) {
-  return new ByteLengthQueuingStrategy({ highWaterMark: buff_size });
+  return buff_size > 0 ? new ByteLengthQueuingStrategy({ highWaterMark: buff_size }) : undefined;
 }
 
-/**
- * Create an XHTTP client.
- * 
- * Modified for stream-one: Instead of using an explicit transform function,
- * we use the default identity transformer by omitting a transformer argument.
- * This lets the platform handle chunk transfer natively, reducing per-chunk JS overhead.
- */
-function create_xhttp_client(cfg, client_readable) {
-  const transformStream = new TransformStream(undefined);
+function create_xhttp_client(cfg, buff_size, client_readable) {
+  const transformStream = new TransformStream(
+    {
+      transform(chunk, controller) {
+        controller.enqueue(chunk);
+      },
+    },
+    create_queuing_strategy(buff_size)
+  );
 
   const headers = {
-    'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST',
-        'Cache-Control': 'no-store',
-        'X-Accel-Buffering': 'no',
-    'content-type': 'application/grpc',
+    'X-Accel-Buffering': 'no',
+    'Cache-Control': 'no-store',
+   // Connection: 'Keep-Alive',
+    'User-Agent': 'Go-http-client/2.0',
+    'Content-Type': 'application/grpc',
   };
 
+  // Use the capped random padding.
   const padding = random_padding(cfg.XPADDING_RANGE);
   if (padding) headers['X-Padding'] = padding;
 
@@ -447,90 +378,78 @@ function create_xhttp_client(cfg, client_readable) {
     readable: client_readable,
     writable: transformStream.writable,
     resp,
-    close: () => {
-      try {
-        const writer = transformStream.writable.getWriter();
-        writer.close().catch(() => {});
-      } catch (e) {}
-    }
   };
 }
-function safeCloseWebSocket(ws, log) {
-  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-    return;
-  }
-  try {
-    ws.close();
-  } catch (err) {
-    log.error("Error closing WebSocket:", err);
-  }
-}
-function makeWebSocketStreams(ws, earlyData, log) {
-  
 
+/**
+ * Modified create_ws_client() to add early data support.
+ * An extra parameter "earlyData" is now accepted.
+ */
+function create_ws_client(log, buff_size, ws_client, ws_server, earlyData) {
+  const abort_ctrl = new AbortController();
+  let wsRunning = true;
+  let reading = true, writing = true;
+  function close() {
+    if (wsRunning) {
+      wsRunning = false;
+      try {
+        ws_server.close();
+      } catch (err) {
+        log.error(`close ws server error: ${err}`);
+      }
+    }
+  }
+  function try_close() {
+    if (!reading && !writing) close();
+  }
+  function reading_done() {
+    reading = false;
+    log.debug("ws reader closed");
+    try_close();
+  }
   const readable = new ReadableStream({
     start(controller) {
-      // Enqueue early data if provided.
+      // Add early data if provided.
       if (earlyData) {
-        try {
-          const earlyBuffer = base64ToArrayBuffer(earlyData);
-          if (earlyBuffer) {
-            log.info("Enqueuing early data", earlyBuffer.byteLength);
-            controller.enqueue(earlyBuffer);
-          }
-        } catch (err) {
-          log.error("Failed to decode early data", err);
+        const earlyBuffer = base64ToArrayBuffer(earlyData);
+        if (earlyBuffer) {
+          log.info("Enqueuing early data, byteLength:", earlyBuffer.byteLength);
+          controller.enqueue(earlyBuffer);
+        } else {
+          log.error("Failed to decode early data.");
         }
       }
-      ws.addEventListener("message", (event) => {
-        controller.enqueue(event.data);
-      });
-      ws.addEventListener("error", (err) => {
-        log.error("WebSocket server error", err);
+      ws_server.addEventListener('message', ({ data }) => controller.enqueue(data));
+      ws_server.addEventListener('error', (err) => {
+        log.error(`ws server error: ${err.message}`);
+        abort_ctrl.abort();
         controller.error(err);
       });
-      ws.addEventListener("close", () => {
-        log.info("WebSocket server closed");
+      ws_server.addEventListener('close', () => {
+        log.debug("ws server closed");
+        wsRunning = false;
+        abort_ctrl.abort();
         controller.close();
       });
     }
-  });
-
+  }, create_queuing_strategy(buff_size));
   const writable = new WritableStream({
     write(chunk) {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(chunk);
-      }
+      if (!abort_ctrl.signal.aborted) ws_server.send(chunk);
+    },
+    close() {
+      log.debug("ws writer closed");
+      writing = false;
+      try_close();
     }
-  });
-
-  return { readable, writable };
-}
-
-
-function create_ws_client(log, ws_client, ws_server, earlyData) {
-  const abort_ctrl = new AbortController();
-  let wsClosed = false;
-
-  function close() {
-    if (!wsClosed) {
-      wsClosed = true;
-      safeCloseWebSocket(ws_server, log);
-      abort_ctrl.abort();
-    }
-  }
-
-  const { readable, writable } = makeWebSocketStreams(ws_server, earlyData, log);
-
-  ws_server.accept();
-   
-
+  }, create_queuing_strategy(buff_size));
   return {
     readable,
     writable,
     resp: new Response(null, { status: 101, webSocket: ws_client }),
     signal: abort_ctrl.signal,
     close,
+    reading_done,
   };
 }
 
@@ -710,19 +629,37 @@ ${url.origin}/${xhttp_path}/?fragment=true&uuid=${uuid}
 Refresh this page to re‑generate a random settings example.`;
 }
 
-
-
 function isValidIP(ip) {
-  return isIPAddress(ip);
+  return IPV4_REGEX.test(ip);
+}
+
+/**
+ * If the URL path has two segments and the second is an IP address,
+ * override cfg.PROXY with that IP and revert the pathname.
+ */
+function extractProxyAndRevertPath(url, cfg) {
+  const pathParts = url.pathname.split('/').filter(Boolean);
+  if (pathParts.length === 2 && isValidIP(pathParts[1])) {
+    cfg.PROXY = pathParts[1];
+    url.pathname = `/${pathParts[0]}`;
+    return true;
+  }
+  return false;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
    Main Request Handler
    ───────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * The main request handler.
+ * Note: The signature now includes a third parameter ctx (the execution context)
+ * so that we can use ctx.waitUntil() to detach long‑lived connections.
+ */
 async function main(request, env, ctx) {
   const url = new URL(request.url);
 
+  // Extract proxy IP from URL path (if provided).
   let proxyIP = '';
   const pathParts = url.pathname.split('/').filter(p => p.length > 0);
   if (pathParts.length === 2 && isValidIP(pathParts[1])) {
@@ -730,6 +667,7 @@ async function main(request, env, ctx) {
     url.pathname = `/${pathParts[0]}/`;
   }
 
+  // Load settings and override proxy if necessary.
   const cfg = load_settings(env, SETTINGS);
   if (proxyIP) {
     cfg.PROXY = proxyIP;
@@ -739,25 +677,30 @@ async function main(request, env, ctx) {
     log.info(`Using proxy IP from URL path: ${cfg.PROXY}`);
   }
 
+  // If UUID is not set, show an example configuration.
   if (!cfg.UUID) {
     return new Response(example(url));
   }
 
-  let buff_size = (parseInt(cfg.BUFFER_SIZE, 10) || 0) * 1024;
+  const path = url.pathname;
+  const buff_size = (parseInt(cfg.BUFFER_SIZE, 10) || 0) * 1024;
 
-  if (cfg.WS_PATH &&
+  // Handle WebSocket transport.
+  if (
+    cfg.WS_PATH &&
     request.headers.get('Upgrade') === 'websocket' &&
-    url.pathname === cfg.WS_PATH
+    path === cfg.WS_PATH
   ) {
     log.debug("Accepting WebSocket client");
     const wsPair = new WebSocketPair();
     const ws_client = wsPair[0];
     const ws_server = wsPair[1];
+    // Extract early data from sec-websocket-protocol header.
     const earlyData = request.headers.get('sec-websocket-protocol') || '';
-    const client = create_ws_client(log, ws_client, ws_server, earlyData);
+    const client = create_ws_client(log, buff_size, ws_client, ws_server, earlyData);
     try {
-    
-      
+      ws_server.accept();
+      // Detach the long‑lived connection so the fetch event can return immediately.
       ctx.waitUntil(handle_client(cfg, log, client));
       return client.resp;
     } catch (err) {
@@ -767,20 +710,25 @@ async function main(request, env, ctx) {
     }
   }
 
-  if (cfg.XHTTP_PATH &&
+  // Handle XHTTP transport.
+  if (
+    cfg.XHTTP_PATH &&
     request.method === 'POST' &&
-    url.pathname === cfg.XHTTP_PATH
+    path === cfg.XHTTP_PATH
   ) {
     log.debug("Accepting XHTTP client");
-    const client = create_xhttp_client(cfg, request.body);
+    const client = create_xhttp_client(cfg, buff_size, request.body);
+    // Detach the long‑lived connection so that the fetch event returns immediately.
     ctx.waitUntil(handle_client(cfg, log, client));
     return client.resp;
   }
 
-  if (cfg.DOH_QUERY_PATH && append_slash(url.pathname).endsWith(append_slash(cfg.DOH_QUERY_PATH))) {
+  // Handle DoH requests.
+  if (cfg.DOH_QUERY_PATH && append_slash(path).endsWith(append_slash(cfg.DOH_QUERY_PATH))) {
     return handle_doh(log, request, url, cfg.UPSTREAM_DOH);
   }
 
+  // Handle JSON and plain GET requests.
   if (request.method === 'GET' && !request.headers.get('Upgrade')) {
     const o = handle_json(cfg, url, request);
     if (o) {
@@ -795,16 +743,22 @@ async function main(request, env, ctx) {
 }
 
 function load_settings(env, settings) {
+  if (cfgCache) return cfgCache;
   const cfg = Object.assign({}, settings, env);
+  cfg.BUFFER_SIZE = parseInt(cfg.BUFFER_SIZE, 10) || 0;
+  // The yield-related settings are no longer used.
   cfg.TIME_DRIFT = (parseInt(cfg.TIME_ZONE, 10) || 0) * 3600 * 1000;
   ['XHTTP_PATH', 'WS_PATH', 'DOH_QUERY_PATH'].forEach(feature => {
     if (cfg[feature]) cfg[feature] = append_slash(cfg[feature]);
   });
+  cfgCache = cfg;
   return cfg;
 }
 
 export default {
+  // Note: Cloudflare Workers will call fetch(request, env, ctx)
   fetch: main,
+  // For unit testing:
   concat_typed_arrays,
   parse_uuid,
   random_id,
